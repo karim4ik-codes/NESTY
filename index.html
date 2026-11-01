@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Мини-мессенджер</title>
+<style>
+  :root { --bg:#0f1720; --panel:#17212b; --me:#2b5278; --other:#1e2c3a; --text:#e8eef3; --muted:#8a9aa9; --accent:#4fa3e0; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, sans-serif; background:var(--bg); color:var(--text); height:100vh; display:flex; flex-direction:column; }
+  header { padding:12px 16px; background:var(--panel); display:flex; justify-content:space-between; align-items:center; gap:8px; }
+  header .right { display:flex; align-items:center; gap:12px; }
+  header small { color:var(--muted); }
+  #messages { flex:1; overflow-y:auto; padding:16px; display:flex; flex-direction:column; gap:8px; }
+  .msg { max-width:75%; padding:8px 12px; border-radius:12px; background:var(--other); word-wrap:break-word; }
+  .msg.me { align-self:flex-end; background:var(--me); }
+  .msg .who { font-size:12px; color:var(--accent); margin-bottom:2px; }
+  .msg .time { font-size:11px; color:var(--muted); text-align:right; }
+  .system { align-self:center; color:var(--muted); font-size:13px; }
+  #typing { height:18px; padding:0 16px; color:var(--muted); font-size:13px; }
+  form { display:flex; gap:8px; padding:12px 16px; background:var(--panel); }
+  input { flex:1; padding:10px; border-radius:8px; border:none; background:var(--bg); color:var(--text); font-size:15px; }
+  button { padding:10px 16px; border:none; border-radius:8px; background:var(--accent); color:white; font-size:15px; cursor:pointer; }
+  button.ghost { background:transparent; color:var(--muted); padding:6px 8px; font-size:13px; }
+  #auth { position:fixed; inset:0; background:var(--bg); display:flex; align-items:center; justify-content:center; padding:16px; }
+  #auth form { flex-direction:column; width:100%; max-width:300px; border-radius:12px; padding:24px; }
+  #auth h2 { margin:0 0 4px; }
+  .tabs { display:flex; gap:4px; margin-bottom:4px; }
+  .tabs button { flex:1; background:var(--bg); color:var(--muted); }
+  .tabs button.active { background:var(--accent); color:white; }
+  .hint { color:var(--muted); font-size:12px; }
+  #error { color:#ff6b6b; font-size:13px; min-height:16px; }
+</style>
+</head>
+<body>
+
+<!-- Экран входа / регистрации -->
+<div id="auth">
+  <form id="authForm">
+    <h2>💬 Мини-мессенджер</h2>
+    <div class="tabs">
+      <button type="button" id="tabLogin" class="active">Вход</button>
+      <button type="button" id="tabReg">Регистрация</button>
+    </div>
+    <input class="reg-only" id="name" placeholder="Твоё имя" maxlength="20" hidden>
+    <input id="phone" type="tel" placeholder="Номер: +7 701 123 45 67" autocomplete="tel">
+    <input id="password" type="password" placeholder="Пароль (мин. 6 символов)" autocomplete="current-password">
+    <input class="reg-only" id="code" type="password" placeholder="Код приглашения" hidden>
+    <div id="error"></div>
+    <button id="authBtn">Войти</button>
+    <div class="hint">Переписка сохраняется на этом устройстве.</div>
+  </form>
+</div>
+
+<!-- Сам чат -->
+<header>
+  <b>💬 <span id="me"></span></b>
+  <div class="right">
+    <small id="online">онлайн: 0</small>
+    <button class="ghost" id="logout">Выйти</button>
+  </div>
+</header>
+<div id="messages"></div>
+<div id="typing"></div>
+<form id="sendForm">
+  <input id="text" placeholder="Сообщение..." autocomplete="off" maxlength="1000">
+  <button>➤</button>
+</form>
+
+<script src="/socket.io/socket.io.js"></script>
+<script>
+  // ===== Мини-мессенджер: КЛИЕНТ (то, что в браузере) =====
+  const socket = io();
+  const $ = (id) => document.getElementById(id);
+
+  // localStorage — маленькое хранилище внутри браузера на ЭТОМ устройстве.
+  // try/catch: в режиме "инкогнито" оно может не работать — тогда просто не сохраняем.
+  const store = {
+    get(key) { try { return JSON.parse(localStorage.getItem(key)); } catch { return null; } },
+    set(key, val) { try { localStorage.setItem(key, JSON.stringify(val)); } catch {} },
+    del(key) { try { localStorage.removeItem(key); } catch {} },
+  };
+  const TOKEN_KEY = "mm_token";
+  const chatKey = () => "mm_chat_" + me.uid; // у каждого аккаунта своя переписка
+  const MAX_SAVED = 2000; // сколько сообщений хранить на устройстве
+
+  let me = null;          // { uid, name }
+  let chat = [];          // все сообщения на этом устройстве
+  let known = new Set();  // id уже показанных сообщений (чтобы не было дублей)
+
+  // ---------- Вкладки "Вход" / "Регистрация" ----------
+  let mode = "login";
+  function setMode(m) {
+    mode = m;
+    $("tabLogin").classList.toggle("active", m === "login");
+    $("tabReg").classList.toggle("active", m === "register");
+    document.querySelectorAll(".reg-only").forEach((el) => (el.hidden = m !== "register"));
+    $("authBtn").textContent = m === "login" ? "Войти" : "Создать аккаунт";
+    $("password").autocomplete = m === "login" ? "current-password" : "new-password";
+    $("error").textContent = "";
+  }
+  $("tabLogin").onclick = () => setMode("login");
+  $("tabReg").onclick = () => setMode("register");
+
+  $("authForm").onsubmit = (e) => {
+    e.preventDefault();
+    const data = { phone: $("phone").value, password: $("password").value };
+    if (mode === "register") {
+      data.name = $("name").value;
+      data.code = $("code").value;
+    }
+    socket.emit(mode, data); // событие "login" или "register"
+  };
+
+  // ---------- Подключение ----------
+  // Срабатывает при первом подключении И после каждого переподключения
+  socket.on("connect", () => {
+    const token = store.get(TOKEN_KEY);
+    if (token) socket.emit("resume", { token });
+  });
+
+  socket.on("resume-failed", () => {
+    store.del(TOKEN_KEY);
+    showAuth("Войди снова");
+  });
+
+  socket.on("auth-error", (text) => ($("error").textContent = text));
+
+  socket.on("joined", ({ me: user, token, history }) => {
+    me = user;
+    store.set(TOKEN_KEY, token);
+    chat = store.get(chatKey()) || []; // 1. берём переписку с устройства
+    known = new Set(chat.map((m) => m.id));
+    history.forEach(remember);         // 2. добавляем новое с сервера
+    saveChat();
+    $("me").textContent = me.name;
+    $("auth").style.display = "none";
+    $("password").value = "";
+    renderAll();
+    $("text").focus();
+  });
+
+  // ---------- Выход ----------
+  $("logout").onclick = () => {
+    if (!me) return;
+    socket.emit("logout", { token: store.get(TOKEN_KEY) });
+    store.del(TOKEN_KEY);
+    if (confirm("Удалить сохранённую переписку с этого устройства?")) store.del(chatKey());
+    me = null;
+    $("messages").innerHTML = "";
+    showAuth("");
+  };
+
+  function showAuth(text) {
+    $("auth").style.display = "flex";
+    $("error").textContent = text;
+  }
+
+  // ---------- Сообщения ----------
+  $("sendForm").onsubmit = (e) => {
+    e.preventDefault();
+    const text = $("text").value.trim();
+    if (!text) return;
+    socket.emit("message", text);
+    $("text").value = "";
+  };
+  $("text").oninput = () => socket.emit("typing");
+
+  socket.on("message", (msg) => {
+    if (!me || !remember(msg)) return;
+    saveChat();
+    drawMessage(msg);
+  });
+
+  // Добавляет сообщение в память, если его ещё нет. Возвращает true, если оно новое.
+  function remember(msg) {
+    if (known.has(msg.id)) return false;
+    known.add(msg.id);
+    chat.push(msg);
+    return true;
+  }
+
+  function saveChat() {
+    chat.sort((a, b) => a.time - b.time);
+    chat = chat.slice(-MAX_SAVED);
+    store.set(chatKey(), chat);
+  }
+
+  socket.on("system", (text) => { if (me) addLine(text); });
+  socket.on("online", (list) => {
+    $("online").textContent = `онлайн: ${list.length}`;
+    $("online").title = list.join(", ");
+  });
+
+  let typingTimer;
+  socket.on("typing", (name) => {
+    $("typing").textContent = `${name} печатает...`;
+    clearTimeout(typingTimer);
+    typingTimer = setTimeout(() => ($("typing").textContent = ""), 1500);
+  });
+
+  // ---------- Рисование ----------
+  function renderAll() {
+    $("messages").innerHTML = "";
+    chat.forEach(drawMessage);
+  }
+
+  function drawMessage(msg) {
+    const div = document.createElement("div");
+    div.className = "msg" + (msg.uid === me.uid ? " me" : "");
+    const d = new Date(msg.time);
+    const time = d.toLocaleDateString([], { day: "2-digit", month: "2-digit" }) + " " +
+                 d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    // textContent (а не innerHTML) защищает от взлома через сообщения
+    const who = document.createElement("div"); who.className = "who"; who.textContent = msg.name;
+    const body = document.createElement("div"); body.textContent = msg.text;
+    const t = document.createElement("div"); t.className = "time"; t.textContent = time;
+    div.append(who, body, t);
+    show(div);
+  }
+
+  function addLine(text) {
+    const div = document.createElement("div");
+    div.className = "system";
+    div.textContent = text;
+    show(div);
+  }
+
+  function show(el) {
+    $("messages").append(el);
+    $("messages").scrollTop = $("messages").scrollHeight;
+  }
+</script>
+</body>
+</html>
